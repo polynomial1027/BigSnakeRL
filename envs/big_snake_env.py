@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
@@ -37,20 +38,22 @@ class RenderConfig:
 
 class BigSnakeEnv(gym.Env):
     """
-    大型贪吃蛇（ML-friendly）
-    - Gymnasium API: reset/step
-    - observation: (4, H, W) uint8
-      channel0=body channel1=head channel2=food channel3=reserved(walls)
-    - action: 0上 1右 2下 3左
-    - render: pygame (不读取事件队列，不吞键盘；事件由外部脚本处理)
+    BigSnakeEnv with "author-style" reward mechanism (the one you pasted).
 
-    Reward 组成：
-    1) step_penalty: 每步轻微惩罚
-    2) food_reward: 吃到食物奖励
-    3) death_penalty: 死亡惩罚
-    4) stall penalty: 超过 stall_K 步未吃到食物，逐渐加大惩罚（每步 cap）
-    5) loop penalty: 最近窗口内 head 位置重复率过高（绕圈）则惩罚
-    6) distance_shaping: 可选，朝食物更近给微弱正奖励（用 dist_prev - dist_now）
+    Observation: (4, H, W) uint8
+      ch0=body, ch1=head, ch2=food, ch3=reserved
+    Actions: Discrete(4) 0 up,1 right,2 down,3 left
+
+    Reward (author-style):
+      - Victory: 0.1 * max_growth
+      - Game over: -0.1 * max_growth^((grid_size - snake_size)/max_growth)  in (-0.1*max_growth, -0.1]
+      - Food: snake_size / grid_size   (0..1)
+      - Shaping: +0.1*(1/snake_size) if closer to food else -0.1*(1/snake_size)
+      - Step limit: step_limit = grid_size * 4 (default) triggers done (then game over penalty)
+
+    Notes:
+      - forbid_reverse=True prevents direct reverse moves.
+      - render() uses pygame; training should run with render_mode=None.
     """
 
     metadata = {"render_modes": ["human", None], "render_fps": 30}
@@ -59,25 +62,17 @@ class BigSnakeEnv(gym.Env):
         self,
         width: int = 40,
         height: int = 30,
-        max_steps: int = 5000,
+        max_steps: int = 10**9,          # keep, but step_limit will end earlier if enabled
         render_mode: Optional[str] = None,
         forbid_reverse: bool = True,
-        # --- core rewards ---
-        step_penalty: float = -0.05,
-        food_reward: float = 100.0,
-        death_penalty: float = -100.0,
-        # --- optional distance shaping ---
-        distance_shaping: float = 0.0,
-        # --- stall penalty ---
-        stall_K: int = 100,
-        stall_lambda: float = 0.01,
-        stall_cap: float = 0.15,
-        # --- loop penalty ---
-        loop_window: int = 80,
-        loop_ratio_threshold: float = 0.40,
-        loop_penalty: float = 0.05,
-        # --- render config ---
+
+        # author-style toggles
+        limit_step: bool = True,
+        step_limit_factor: int = 4,      # step_limit = grid_size * factor
+
+        # render
         render_cfg: Optional[RenderConfig] = None,
+
         seed: Optional[int] = None,
     ):
         super().__init__()
@@ -87,19 +82,8 @@ class BigSnakeEnv(gym.Env):
         self.render_mode = render_mode
         self.forbid_reverse = forbid_reverse
 
-        # reward params
-        self.step_penalty = float(step_penalty)
-        self.food_reward = float(food_reward)
-        self.death_penalty = float(death_penalty)
-        self.distance_shaping = float(distance_shaping)
-
-        self.stall_K = int(stall_K)
-        self.stall_lambda = float(stall_lambda)
-        self.stall_cap = float(stall_cap)
-
-        self.loop_window = int(loop_window)
-        self.loop_ratio_threshold = float(loop_ratio_threshold)
-        self.loop_penalty = float(loop_penalty)
+        self.limit_step = bool(limit_step)
+        self.step_limit_factor = int(step_limit_factor)
 
         self.render_cfg = render_cfg or RenderConfig()
         self._rng = random.Random(seed)
@@ -116,12 +100,14 @@ class BigSnakeEnv(gym.Env):
         self.steps: int = 0
         self.score: int = 0
 
-        # trackers
-        self._prev_dist: Optional[int] = None
-        self.steps_since_food: int = 0
-        self.head_history = deque(maxlen=self.loop_window)
+        # author-style counters
+        self.grid_size = self.w * self.h
+        self.init_snake_size = 4
+        self.max_growth = self.grid_size - self.init_snake_size
+        self.step_limit = (self.grid_size * self.step_limit_factor) if self.limit_step else int(1e12)
+        self.reward_step_counter = 0
 
-        # pygame
+        # rendering
         self._pg_inited = False
         self._screen = None
         self._clock = None
@@ -135,17 +121,12 @@ class BigSnakeEnv(gym.Env):
 
         self.steps = 0
         self.score = 0
+        self.reward_step_counter = 0
 
         cx, cy = self.w // 2, self.h // 2
         self.dir = 1  # right
-        self.snake = [(cx - i, cy) for i in range(4)]  # head at index 0
+        self.snake = [(cx - i, cy) for i in range(self.init_snake_size)]
         self._place_food()
-
-        self.steps_since_food = 0
-        self.head_history.clear()
-        self.head_history.append(self.snake[0])
-
-        self._prev_dist = self._manhattan(self.snake[0], self.food)
 
         obs = self._get_obs()
         info = self._get_info()
@@ -158,87 +139,99 @@ class BigSnakeEnv(gym.Env):
     def step(self, action: int):
         self.steps += 1
 
-        # direction constraint
         action = int(action)
         if self.forbid_reverse and self._is_reverse(action, self.dir):
             action = self.dir
         else:
             self.dir = action
 
+        self.reward_step_counter += 1
+
         head = self.snake[0]
         dx, dy = DIRS[self.dir]
         new_head = (head[0] + dx, head[1] + dy)
 
-        reward = self.step_penalty
-        terminated = False
+        prev_dist = self._l2(head, self.food)
+
+        done = False
         truncated = False
+        reward = 0.0
 
-        # 默认：又过去了一步没吃到
-        self.steps_since_food += 1
+        # victory (fills board)
+        if len(self.snake) == self.grid_size:
+            reward = self.max_growth * 0.1
+            done = True
+            obs = self._get_obs()
+            info = self._get_info()
+            return obs, float(reward), done, truncated, info
 
-        # 撞墙
+        # step limit (author-style)
+        if self.reward_step_counter > self.step_limit:
+            self.reward_step_counter = 0
+            done = True
+
+        # compute collisions (tail logic)
+        will_grow = (new_head == self.food)
+
+        # wall collision
         if not (0 <= new_head[0] < self.w and 0 <= new_head[1] < self.h):
-            reward += self.death_penalty
-            terminated = True
+            done = True
         else:
-            # 撞自己：若不增长则尾巴会移动，尾巴位置不应算碰撞
-            will_grow = (new_head == self.food)
-            body_set = set(self.snake[:-1] if not will_grow else self.snake)
-            if new_head in body_set:
-                reward += self.death_penalty
-                terminated = True
-
-        ate_food = False
-
-        if not terminated:
-            # move
-            self.snake.insert(0, new_head)
-
-            if new_head == self.food:
-                ate_food = True
-                self.score += 1
-                reward += self.food_reward
-                self._place_food()
-                self.steps_since_food = 0
+            if will_grow:
+                body_set = set(self.snake)           # tail not removed
             else:
-                self.snake.pop()
+                body_set = set(self.snake[:-1])      # tail would move
+            if new_head in body_set:
+                done = True
 
-            # update head history
-            self.head_history.append(self.snake[0])
+        # if done => game over penalty (author-style, based on snake size)
+        if done:
+            snake_size = len(self.snake)
+            exp = (self.grid_size - snake_size) / max(1, self.max_growth)
+            reward = - math.pow(max(1.0, float(self.max_growth)), exp)
+            reward *= 0.1
+            obs = self._get_obs()
+            info = self._get_info()
+            return obs, float(reward), True, truncated, info
 
-            # distance shaping: 朝食物更近则 +，更远则 -
-            if self.distance_shaping != 0.0:
-                dist = self._manhattan(self.snake[0], self.food)
-                if self._prev_dist is not None:
-                    reward += self.distance_shaping * (self._prev_dist - dist)
-                self._prev_dist = dist
+        # not done => perform move
+        self.snake.insert(0, new_head)
 
-            # stall penalty: 超过 K 步没吃到，线性增长，且 per-step cap
-            if (not ate_food) and (self.steps_since_food > self.stall_K) and (self.stall_lambda != 0.0):
-                extra = -self.stall_lambda * (self.steps_since_food - self.stall_K) / max(1, self.stall_K)
-                extra = max(extra, -abs(self.stall_cap))
-                reward += extra
+        food_obtained = False
+        if will_grow:
+            food_obtained = True
+            self.score += 1
+            self._place_food()
+            self.reward_step_counter = 0
+        else:
+            self.snake.pop()
 
-            # loop penalty: 位置重复率过高则惩罚
-            if self.loop_penalty != 0.0 and len(self.head_history) == self.loop_window:
-                unique_ratio = len(set(self.head_history)) / float(self.loop_window)
-                if unique_ratio < self.loop_ratio_threshold:
-                    reward -= abs(self.loop_penalty)
+        # food reward (author-style)
+        if food_obtained:
+            reward = len(self.snake) / float(self.grid_size)
+        else:
+            # tiny shaping based on closer/farther to food
+            new_dist = self._l2(new_head, self.food)
+            if new_dist < prev_dist:
+                reward = 1.0 / float(len(self.snake))
+            else:
+                reward = -1.0 / float(len(self.snake))
+            reward *= 0.1
 
+        # truncate by max_steps if you still want a hard cap
         if self.steps >= self.max_steps:
             truncated = True
 
         obs = self._get_obs()
         info = self._get_info()
-        info.update({
-            "steps_since_food": self.steps_since_food,
-            "unique_ratio": (len(set(self.head_history)) / float(len(self.head_history))) if len(self.head_history) > 0 else 1.0,
-        })
+        info["food_obtained"] = food_obtained
+        info["reward_step_counter"] = self.reward_step_counter
+        info["step_limit"] = self.step_limit
 
         if self.render_mode == "human":
             self.render()
 
-        return obs, reward, terminated, truncated, info
+        return obs, float(reward), False, truncated, info
 
     def render(self):
         if pygame is None:
@@ -266,8 +259,6 @@ class BigSnakeEnv(gym.Env):
         self._draw_snake()
 
         pygame.display.flip()
-
-        # 关键：不读取事件队列（不 pygame.event.get），避免吞键盘事件
         pygame.event.pump()
 
     def close(self):
@@ -282,19 +273,18 @@ class BigSnakeEnv(gym.Env):
     def _get_obs(self) -> np.ndarray:
         obs = np.zeros((4, self.h, self.w), dtype=np.uint8)
         for (x, y) in self.snake[1:]:
-            obs[0, y, x] = 255  # body
+            obs[0, y, x] = 255
         hx, hy = self.snake[0]
-        obs[1, hy, hx] = 255  # head
+        obs[1, hy, hx] = 255
         fx, fy = self.food
-        obs[2, fy, fx] = 255  # food
-        # obs[3] reserved (walls)
+        obs[2, fy, fx] = 255
         return obs
 
     def _get_info(self) -> Dict[str, Any]:
         return {
             "score": self.score,
             "steps": self.steps,
-            "snake_len": len(self.snake),
+            "snake_size": len(self.snake),
             "head": self.snake[0],
             "food": self.food,
             "dir": self.dir,
@@ -314,8 +304,9 @@ class BigSnakeEnv(gym.Env):
         return (a + 2) % 4 == b
 
     @staticmethod
-    def _manhattan(p: Tuple[int, int], q: Tuple[int, int]) -> int:
-        return abs(p[0] - q[0]) + abs(p[1] - q[1])
+    def _l2(p: Tuple[int, int], q: Tuple[int, int]) -> float:
+        # L2 distance, same spirit as the reference code
+        return float(np.linalg.norm(np.array(p, dtype=np.float32) - np.array(q, dtype=np.float32)))
 
     # ----------------- drawing -----------------
 
@@ -344,7 +335,7 @@ class BigSnakeEnv(gym.Env):
         pygame.draw.rect(self._screen, (16, 18, 26), hud_rect)
 
         font = pygame.font.SysFont("Consolas", 20)
-        text = f"Score:{self.score}  Steps:{self.steps}  Len:{len(self.snake)}  SinceFood:{self.steps_since_food}"
+        text = f"Score:{self.score}  Steps:{self.steps}  Len:{len(self.snake)}  Ctr:{self.reward_step_counter}/{self.step_limit}"
         surf = font.render(text, True, (220, 225, 235))
         self._screen.blit(surf, (cfg.margin, 12))
 
@@ -419,16 +410,16 @@ class BigSnakeEnv(gym.Env):
         offset = head_rect.w // 5
         eye_r = max(2, head_rect.w // 10)
 
-        if self.dir == 0:      # up
+        if self.dir == 0:
             p1 = (cx - offset, cy - offset)
             p2 = (cx + offset, cy - offset)
-        elif self.dir == 2:    # down
+        elif self.dir == 2:
             p1 = (cx - offset, cy + offset)
             p2 = (cx + offset, cy + offset)
-        elif self.dir == 1:    # right
+        elif self.dir == 1:
             p1 = (cx + offset, cy - offset)
             p2 = (cx + offset, cy + offset)
-        else:                  # left
+        else:
             p1 = (cx - offset, cy - offset)
             p2 = (cx - offset, cy + offset)
 
