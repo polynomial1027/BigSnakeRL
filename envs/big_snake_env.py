@@ -64,8 +64,8 @@ class BigSnakeEnv(gym.Env):
         forbid_reverse: bool = True,
         # --- core rewards ---
         step_penalty: float = -0.05,
-        food_reward: float = 10.0,
-        death_penalty: float = -10.0,
+        food_reward: float = 100.0,
+        death_penalty: float = -100.0,
         # --- optional distance shaping ---
         distance_shaping: float = 0.0,
         # --- stall penalty ---

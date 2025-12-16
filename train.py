@@ -84,10 +84,10 @@ def get_stage_config(stage: int) -> StageConfig:
     if stage == 1:
         return StageConfig(
             width=30, height=20, max_steps=1000,
-            food_reward=10.0,
-            death_penalty=-10.0,
+            food_reward=100.0,
+            death_penalty=-100.0,
             step_penalty=-0.001,
-            distance_shaping=0.02,     # 强引导：接近食物给正反馈
+            distance_shaping=0.2,     # 强引导：接近食物给正反馈
 
             stall_K=10**9, stall_lambda=0.0, stall_cap=0.0,  # 先关停滞罚
             loop_window=80, loop_ratio_threshold=0.40, loop_penalty=0.0,  # 先关绕圈罚
